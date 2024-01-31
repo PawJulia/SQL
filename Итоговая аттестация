@@ -1,0 +1,149 @@
+#----Разработать базу данных для управления библиотекой, включая функционал для отслеживания книг и журнала выдачи
+
+
+#----Задачи проекта
+
+#----1. Создание таблиц
+
+CREATE TABLE books (
+    id SERIAL PRIMARY KEY,
+    title TEXT,
+    author TEXT,
+    year_of_publication INT,
+    genre TEXT
+);
+
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    age TEXT,
+    sex INT
+);
+
+CREATE TABLE borrow_log (
+    id SERIAL PRIMARY KEY,
+    user_id INT,
+    book_id INT,
+    date_of_issue DATE,
+    date_of_return DATE,
+    FOREIGN KEY (book_id) REFERENCES books (id),
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+
+#----2. Создать материализованное представление, отображающее доступные книги
+
+CREATE MATERIALIZED VIEW available_books AS
+SELECT b.id, b.title, b.author, b.year_of_publication, b.genre
+FROM books b
+LEFT JOIN borrow_log bl ON b.id = bl.book_id
+WHERE bl.book_id IS NULL OR bl.date_of_return < CURRENT_DATE;
+
+#-----Этот запрос создаст материализованное представление available_books, 
+#-----которое содержит информацию о доступных для займа книгах. 
+#-----Таблица available_books будет обновляться автоматически при изменении 
+#-----данных в таблицах books и borrow_log. Вы можете использовать это представление 
+#-----для получения актуальной информации о доступных книгах без необходимости выполнения сложных запросов.
+
+SELECT  DISTINCT * FROM public.available_books
+
+
+#-----3. Создать индексы для оптимизации запросов
+#----[SQL код для создания индексов по title и genre]
+
+CREATE INDEX idx_books_title ON books (title);
+CREATE INDEX idx_books_genre ON books (genre);
+
+EXPLAIN ANALYZE SELECT * FROM books 
+WHERE genre = 'Общяя психология'
+
+
+#-----4. Полнотекстовый Поиск
+#---- Добавить полнотекстовый индекс к необходимым колонкам и протестировать
+
+SELECT title, author, genre, to_tsvector('russian', genre)
+FROM books
+WHERE to_tsvector('russian', genre) @@ to_tsquery('russian','Спорт | Здоровье') and
+(to_tsvector('russian', author) @@ to_tsquery('russian',' Швец'));
+
+#---- Запрос позволяет запросить книги с жанром «Спорт», «Здоровье». Выбрать интересную книгу для чтения по выбранному жанру.
+#---- Выбрать книгу определенного автора.
+
+
+#-----5. PL/pgSQL: Анонимные Блоки и Операторы
+#---- Написать анонимный блок для обновления available_books
+
+#---- Добавим в таблицы borrow_log новые данные и обновим материализованное представление available_books в анонимном блоке. 
+
+DO $$
+BEGIN
+INSERT INTO borrow_log (id, user_id, book_id, date_of_issue,date_of_return)
+VALUES 
+(3251258, 7, 13, '2023-11-12','2023-11-30'),
+(3215251, 44, 59,'2023-11-15','2023-11-15'),
+(3215255, 456, 70,'2023-11-17','2023-11-25');
+REFRESH MATERIALIZED VIEW available_books;
+END;
+$$ LANGUAGE plpgsql;
+
+#-----6. Курсоры
+#---- -- Использование курсора для обработки записей в borrow_log
+
+#---- Используем курсор для таблицы borrow_log, чтобы построчно посчитать разницу между 
+#---- датой возврата и датой взятия книг, и вывести ID читателя и ID книги, которые не возвращают уже более 2200 дней
+
+DO $$
+DECLARE 
+borrow_cursor CURSOR  FOR
+SELECT *
+FROM borrow_log;
+borrow_record borrow_log%ROWTYPE;
+BEGIN
+
+OPEN borrow_cursor;
+
+LOOP
+    FETCH borrow_cursor INTO borrow_record;
+    EXIT WHEN NOT FOUND;
+    IF borrow_record.date_of_return - borrow_record.date_of_issue > 2200 THEN
+    	RAISE NOTICE 'Запись user_id=%, book_id=%, Кол-во дней %', borrow_record.user_id, borrow_record.book_id, borrow_record.date_of_return - borrow_record.date_of_issue;
+	END IF;
+END LOOP;
+
+CLOSE borrow_cursor;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+#-----7.Создание функции
+#---Разработайте функцию calculate_fine, которая рассчитывает штраф за просрочку возврата книг пользователя.
+
+
+#---На слайде предоставлен код функции calculate, которая рассчитывает штраф за просрочку возврата книг пользователя, 
+#---больше чем на 90 дней. Если пользователь ввел номер читателя без просрочки или пользователь вводит отрицательное 
+#---число, то в окне выводится соответствующее сообщение. Для обработки ошибок искусственно создал ошибки division_by_zero 
+#---и QLSTATE '42703‘ , так как RETURN возвращает числовое значение.
+
+CREATE OR REPLACE FUNCTION calculate(id_num INT)
+RETURNS NUMERIC AS $$
+DECLARE
+ overdue_days INT;
+ fine_per_day NUMERIC := 1.50;
+ book_record RECORD;
+ fine_total NUMERIC := 0;
+BEGIN
+ FOR book_record IN SELECT * FROM borrow_log WHERE id = id_num LOOP
+ overdue_days :=  book_record.date_of_return - book_record.date_of_issue;
+ fine_total := fine_total + (overdue_days * fine_per_day);
+ END LOOP;
+IF (overdue_days = 0) OR (overdue_days < 90 )  THEN RETURN 1/0;
+ElSIF (id_num < 0) OR (id_num % 1 <> 0) THEN RETURN RAISE NOTICE;
+ELSE RETURN fine_total;
+END IF;
+EXCEPTION 
+WHEN division_by_zero THEN
+RAISE NOTICE 'Читатель во время сдал книгу';
+-- WHEN SQLSTATE '42703' THEN
+RAISE NOTICE 'Вы ввели не верный номер читателя';
+END;
+$$ LANGUAGE plpgsql;
